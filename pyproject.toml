@@ -3,14 +3,17 @@ name = "transit-parser"
 version = "0.1.0"
 description = "A set of scripts for parsing transit data into Vega-Lite JSON"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
-    "fastexcel>=0.12.0",
-    "orjson>=3.10.12",
-    "polars>=1.16.0",
-    "requests>=2.32.3",
-    "tqdm>=4.67.1",
+    "fastexcel[polars] @ git+https://github.com/ToucanToco/fastexcel.git@1364f30d53ee944d6d5b4477e413a6831b3e7bd7",
+    "orjson>=3.11",
+    "polars>=1.32",
+    "requests>=2.32",
+    "tqdm>=4.67",
 ]
 
+[tool.setuptools]
+py-modules = []
+
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
