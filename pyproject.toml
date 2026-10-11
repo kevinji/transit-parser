@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastexcel[polars,pyarrow]>=0.15",
     "holidays>=0.80",
-    "orjson>=3.11",
+    "orjson>=3.11.6",
     "polars>=1.32",
     "requests>=2.32",
     "tqdm>=4.67",
