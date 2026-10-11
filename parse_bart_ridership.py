@@ -131,7 +131,7 @@ def original_data_dir() -> str:
 def main():
     original_dir = original_data_dir()
     bart_ridership_oct_df = parse_bart_ridership(
-        os.path.join(original_dir, "bart", "2024-11-29-ridership-202410.xlsx"),
+        os.path.join(original_dir, "bart", "ridership-202410.xlsx"),
     )
     print(bart_ridership_oct_df)
 

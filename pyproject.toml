@@ -5,7 +5,7 @@ description = "A set of scripts for parsing transit data into Vega-Lite JSON"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastexcel[polars]>=0.15",
+    "fastexcel[polars,pyarrow]>=0.15",
     "orjson>=3.11",
     "polars>=1.32",
     "requests>=2.32",
