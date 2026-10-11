@@ -5,6 +5,7 @@ import re
 import orjson
 
 from parse_bart_ridership import parse_bart_weekday_ridership
+from parse_mta_ridership import parse_nyc_subway_weekday_ridership
 from parse_muni_ridership import parse_muni_weekday_ridership
 
 BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?")
@@ -41,11 +42,20 @@ def generate_muni(original_dir: str, generated_dir: str):
     )
 
 
+def generate_nyc_subway(original_dir: str, generated_dir: str):
+    df = parse_nyc_subway_weekday_ridership(
+        os.path.join(original_dir, "mta", "subway-daily-ridership.csv")
+    )
+    write_json(
+        df.to_dicts(), os.path.join(generated_dir, "mta", "weekday-ridership.json")
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate chart data from ridership files"
     )
-    parser.add_argument("mode", choices=["bart", "muni"])
+    parser.add_argument("mode", choices=["bart", "muni", "nyc-subway"])
     args = parser.parse_args()
 
     data_repo = os.environ["DATA_REPO"]
@@ -56,6 +66,8 @@ def main():
             generate_bart(original_dir, generated_dir)
         case "muni":
             generate_muni(original_dir, generated_dir)
+        case "nyc-subway":
+            generate_nyc_subway(original_dir, generated_dir)
 
 
 if __name__ == "__main__":

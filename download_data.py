@@ -7,6 +7,7 @@ import tempfile
 import zipfile
 from urllib.parse import unquote, urljoin, urlparse
 
+import polars as pl
 import requests
 from tqdm import tqdm
 
@@ -15,6 +16,16 @@ SFMTA_MUNI_RIDERSHIP_URL = (
 )
 
 BART_RIDERSHIP_PAGE_URL = "https://www.bart.gov/about/reports/ridership"
+
+# The MTA website blocks scripted downloads, so subway ridership comes from the MTA's
+# datasets on the NY Open Data portal instead. The daily systemwide dataset matches the
+# MTA's published average weekday ridership within 0.5%, but only starts in March 2020;
+# earlier days are summed from the hourly station-level datasets.
+NY_OPEN_DATA_URL = "https://data.ny.gov/resource/{dataset}.json"
+MTA_DAILY_RIDERSHIP_DATASET = "sayj-mze2"
+MTA_DAILY_RIDERSHIP_START = "2020-03-01"
+# MTA Subway Hourly Ridership for 2017-2019 and 2020-2024
+MTA_SUBWAY_HOURLY_DATASETS = ["t69i-h2me", "wujg-7c2s"]
 
 MONTH_NAMES = "|".join(calendar.month_name[1:])
 # Monthly files are named like `Ridership_202601.xlsx`, `Ridership_202401 1.xlsx`,
@@ -120,6 +131,52 @@ def download_muni(original_dir: str):
     )
 
 
+def query_ny_open_data(dataset: str, params: dict[str, str]) -> list[dict]:
+    response = requests.get(
+        NY_OPEN_DATA_URL.format(dataset=dataset),
+        params={"$limit": "50000", **params},
+        timeout=600,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def download_nyc_subway(original_dir: str):
+    rows = []
+    for dataset in MTA_SUBWAY_HOURLY_DATASETS:
+        rows += query_ny_open_data(
+            dataset,
+            {
+                "$select": "date_trunc_ymd(transit_timestamp) AS date, "
+                "sum(ridership) AS riders",
+                "$where": "transit_mode = 'subway' AND "
+                f"transit_timestamp < '{MTA_DAILY_RIDERSHIP_START}'",
+                "$group": "date",
+            },
+        )
+    rows += query_ny_open_data(
+        MTA_DAILY_RIDERSHIP_DATASET,
+        {
+            "$select": "date, count AS riders",
+            "$where": f"mode = 'Subway' AND date >= '{MTA_DAILY_RIDERSHIP_START}'",
+        },
+    )
+
+    df = (
+        pl.DataFrame(rows)
+        .select(
+            date=pl.col("date").str.to_datetime().dt.date(),
+            riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
+        )
+        .sort("date")
+    )
+    assert df["date"].is_unique().all()
+
+    mta_dir = os.path.join(original_dir, "mta")
+    os.makedirs(mta_dir, exist_ok=True)
+    df.write_csv(os.path.join(mta_dir, "subway-daily-ridership.csv"))
+
+
 def download_bart(original_dir: str):
     bart_dir = os.path.join(original_dir, "bart")
     monthly_urls, yearly_zip_urls = find_bart_ridership_urls()
@@ -133,7 +190,7 @@ def download_bart(original_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Download transit ridership data")
-    parser.add_argument("mode", choices=["bart", "muni"])
+    parser.add_argument("mode", choices=["bart", "muni", "nyc-subway"])
     args = parser.parse_args()
 
     original_dir = original_data_dir()
@@ -142,6 +199,8 @@ def main():
             download_bart(original_dir)
         case "muni":
             download_muni(original_dir)
+        case "nyc-subway":
+            download_nyc_subway(original_dir)
 
 
 if __name__ == "__main__":
