@@ -1,6 +1,10 @@
-import os
+import re
 
+import fastexcel
 import polars as pl
+
+STATION_CODE_RE = re.compile(r"^[A-Z0-9]{2}$")
+WEEKDAY_SHEET_RE = re.compile(r"weekday|wkdy", re.IGNORECASE)
 
 
 def parse_station_code(code: str) -> str:
@@ -123,18 +127,37 @@ def parse_bart_ridership(filename: str) -> pl.DataFrame:
     )
 
 
-def original_data_dir() -> str:
-    data_repo = os.environ["DATA_REPO"]
-    return os.path.join(data_repo, "original")
+def is_station_code(cell: str | None) -> bool:
+    return cell is not None and bool(STATION_CODE_RE.match(cell.removesuffix(".0")))
 
 
-def main():
-    original_dir = original_data_dir()
-    bart_ridership_oct_df = parse_bart_ridership(
-        os.path.join(original_dir, "bart", "ridership-202410.xlsx"),
+def parse_bart_weekday_ridership(filename: str) -> float:
+    """
+    Sum the average weekday origin-destination matrix in a BART monthly ridership
+    file. The sheet layout has changed over the years, so this finds the header row
+    of entry station codes and sums the cells whose row and column are both station
+    codes, which skips any entry/exit total rows and columns.
+    """
+    reader = fastexcel.read_excel(filename)
+    sheet_name = next(
+        name for name in reader.sheet_names if WEEKDAY_SHEET_RE.search(name)
     )
-    print(bart_ridership_oct_df)
+    rows = (
+        reader.load_sheet(sheet_name, header_row=None, dtypes="string")
+        .to_polars()
+        .rows()
+    )
 
+    header_index = max(
+        range(min(10, len(rows))),
+        key=lambda i: sum(is_station_code(cell) for cell in rows[i]),
+    )
+    station_columns = [
+        j for j, cell in enumerate(rows[header_index]) if is_station_code(cell)
+    ]
 
-if __name__ == "__main__":
-    main()
+    total = 0.0
+    for row in rows[header_index + 1 :]:
+        if is_station_code(row[0]):
+            total += sum(float(row[j]) for j in station_columns if row[j] is not None)
+    return total
