@@ -1,10 +1,13 @@
 import argparse
 import calendar
+import io
 import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
+from datetime import date, timedelta
 from urllib.parse import unquote, urljoin, urlparse
 
 import polars as pl
@@ -26,6 +29,16 @@ MTA_DAILY_RIDERSHIP_DATASET = "sayj-mze2"
 MTA_DAILY_RIDERSHIP_START = "2020-03-01"
 # MTA Subway Hourly Ridership for 2017-2019 and 2020-2024
 MTA_SUBWAY_HOURLY_DATASETS = ["t69i-h2me", "wujg-7c2s"]
+MTA_SUBWAY_HOURLY_START = date(2017, 2, 1)
+# Before the hourly datasets, daily entries are estimated from the cumulative entry
+# counters that each turnstile reports about every 4 hours. These are the MTA Subway
+# Turnstile Usage Data datasets for 2014-2017, which together cover February 2014
+# onward. Their monthly weekday averages match the hourly datasets within 0.5%.
+MTA_TURNSTILE_DATASETS = ["i55r-43gk", "ug6q-shqc", "ekwu-khcy", "v5y5-mwpb"]
+MTA_TURNSTILE_START = date(2014, 2, 1)
+MTA_SUBWAY_DIVISIONS = ["IRT", "IND", "BMT"]
+# Larger jumps between readings are counter resets or errors rather than entries.
+MTA_TURNSTILE_MAX_ENTRIES_PER_READING = 5000
 
 # WMATA's Metrorail ridership dashboards are Tableau views, which can be exported as CSV.
 # The yearly dashboard's export only contains the date the data runs through.
@@ -149,7 +162,73 @@ def query_ny_open_data(dataset: str, params: dict[str, str]) -> list[dict]:
     return response.json()
 
 
+def download_with_retries(url: str, params: dict[str, str], attempts: int = 5) -> bytes:
+    """
+    Download a response body, retrying on errors. NY Open Data sometimes times out
+    partway through a large response, which `requests`' own retries don't cover.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=300)
+            response.raise_for_status()
+            return response.content
+        except requests.RequestException:
+            if attempt == attempts:
+                raise
+            time.sleep(10 * attempt)
+    raise AssertionError("unreachable")
+
+
+def turnstile_daily_entries(start: date, end: date) -> pl.DataFrame:
+    """
+    Estimate daily subway entries from start to end (exclusive) by summing the
+    increases in each turnstile's cumulative entry counter. Readings from the day
+    before start are included so that the first increase on start can be computed.
+    """
+    divisions = ", ".join(f"'{division}'" for division in MTA_SUBWAY_DIVISIONS)
+    readings = []
+    for dataset in MTA_TURNSTILE_DATASETS:
+        csv = download_with_retries(
+            NY_OPEN_DATA_URL.format(dataset=dataset).removesuffix(".json") + ".csv",
+            params={
+                "$select": "c_a, unit, scp, date, time, entries",
+                "$where": f"division IN ({divisions}) AND "
+                f"date >= '{start - timedelta(days=1)}' AND date < '{end}'",
+                "$limit": "10000000",
+            },
+        )
+        readings.append(pl.read_csv(io.BytesIO(csv), infer_schema=False))
+
+    return (
+        pl.concat(readings)
+        .select(
+            turnstile=pl.concat_str("c_a", "unit", "scp", separator="/"),
+            timestamp=(
+                pl.col("date").str.slice(0, 10) + " " + pl.col("time")
+            ).str.to_datetime("%Y-%m-%d %H:%M:%S"),
+            entries=pl.col("entries").cast(pl.Int64),
+        )
+        .unique(["turnstile", "timestamp"])
+        .sort("turnstile", "timestamp")
+        # Some counters count down, so use the size of each change.
+        .with_columns(increase=pl.col("entries").diff().over("turnstile").abs())
+        .filter(pl.col("increase") <= MTA_TURNSTILE_MAX_ENTRIES_PER_READING)
+        .group_by(date=pl.col("timestamp").dt.date())
+        .agg(riders=pl.col("increase").sum())
+        .filter(pl.col("date") >= start)
+    )
+
+
 def download_nyc_subway(original_dir: str):
+    turnstile_days = []
+    month_start = MTA_TURNSTILE_START
+    with tqdm(desc="turnstile months", unit="month") as pbar:
+        while month_start < MTA_SUBWAY_HOURLY_START:
+            next_month = (month_start + timedelta(days=32)).replace(day=1)
+            turnstile_days.append(turnstile_daily_entries(month_start, next_month))
+            month_start = next_month
+            pbar.update()
+
     rows = []
     for dataset in MTA_SUBWAY_HOURLY_DATASETS:
         rows += query_ny_open_data(
@@ -158,6 +237,7 @@ def download_nyc_subway(original_dir: str):
                 "$select": "date_trunc_ymd(transit_timestamp) AS date, "
                 "sum(ridership) AS riders",
                 "$where": "transit_mode = 'subway' AND "
+                f"transit_timestamp >= '{MTA_SUBWAY_HOURLY_START}' AND "
                 f"transit_timestamp < '{MTA_DAILY_RIDERSHIP_START}'",
                 "$group": "date",
             },
@@ -170,14 +250,15 @@ def download_nyc_subway(original_dir: str):
         },
     )
 
-    df = (
-        pl.DataFrame(rows)
-        .select(
-            date=pl.col("date").str.to_datetime().dt.date(),
-            riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
-        )
-        .sort("date")
-    )
+    df = pl.concat(
+        [
+            *(days.cast({"riders": pl.Int64}) for days in turnstile_days),
+            pl.DataFrame(rows).select(
+                date=pl.col("date").str.to_datetime().dt.date(),
+                riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
+            ),
+        ]
+    ).sort("date")
     assert df["date"].is_unique().all()
 
     mta_dir = os.path.join(original_dir, "mta")
