@@ -1,6 +1,8 @@
 import argparse
+import base64
 import calendar
 import io
+import json
 import os
 import re
 import shutil
@@ -47,6 +49,24 @@ WMATA_MONTHLY_ENTRIES_URL = (
     f"{WMATA_RIDERSHIP_VIEWS_URL}/AvgDailyEntriesbyMonth.csv?Service%20Type=Weekday"
 )
 WMATA_DATA_RANGE_URL = f"{WMATA_RIDERSHIP_VIEWS_URL}/AvgWeekdayEntriesbyYear.csv"
+
+# Sound Transit's ridership tracker is a public Power BI report. Its data can be queried
+# through the API that the embedded report uses, which needs the report's key from the
+# embed URL on the tracker page.
+SOUND_TRANSIT_RIDERSHIP_PAGE_URL = (
+    "https://www.soundtransit.org/ride-with-us/system-performance-tracker/ridership"
+)
+POWER_BI_EMBED_RE = re.compile(r"https://app\.powerbi\.com/view\?r=([A-Za-z0-9_=-]+)")
+POWER_BI_API_URL = (
+    "https://wabi-west-us-c-primary-api.analysis.windows.net/public/reports"
+)
+SOUND_TRANSIT_MONTHLY_COLUMNS = [
+    "MonthRefDate",
+    "Mode",
+    "ScheduleType",
+    "AvgBdgsPerDay",
+    "Boardings",
+]
 
 MONTH_NAMES = "|".join(calendar.month_name[1:])
 # Monthly files are named like `Ridership_202601.xlsx`, `Ridership_202401 1.xlsx`,
@@ -140,11 +160,6 @@ def download_bart_yearly_zip(url: str, bart_dir: str):
                     shutil.copyfileobj(src, dst)
 
 
-def original_data_dir() -> str:
-    data_repo = os.environ["DATA_REPO"]
-    return os.path.join(data_repo, "original")
-
-
 def download_muni(original_dir: str):
     download_file(
         SFMTA_MUNI_RIDERSHIP_URL,
@@ -152,14 +167,12 @@ def download_muni(original_dir: str):
     )
 
 
-def query_ny_open_data(dataset: str, params: dict[str, str]) -> list[dict]:
-    response = requests.get(
-        NY_OPEN_DATA_URL.format(dataset=dataset),
-        params={"$limit": "50000", **params},
-        timeout=600,
+def download_ny_open_data(dataset: str, params: dict[str, str], filename: str):
+    content = download_with_retries(
+        NY_OPEN_DATA_URL.format(dataset=dataset), params={"$limit": "50000", **params}
     )
-    response.raise_for_status()
-    return response.json()
+    with open(filename, "wb") as f:
+        f.write(content)
 
 
 def download_with_retries(url: str, params: dict[str, str], attempts: int = 5) -> bytes:
@@ -219,7 +232,35 @@ def turnstile_daily_entries(start: date, end: date) -> pl.DataFrame:
     )
 
 
-def download_nyc_subway(original_dir: str):
+def download_nyc_subway(original_dir: str, processed_dir: str):
+    mta_dir = os.path.join(original_dir, "mta")
+    os.makedirs(mta_dir, exist_ok=True)
+    for dataset in MTA_SUBWAY_HOURLY_DATASETS:
+        download_ny_open_data(
+            dataset,
+            {
+                "$select": "date_trunc_ymd(transit_timestamp) AS date, "
+                "sum(ridership) AS riders",
+                "$where": "transit_mode = 'subway' AND "
+                f"transit_timestamp >= '{MTA_SUBWAY_HOURLY_START}' AND "
+                f"transit_timestamp < '{MTA_DAILY_RIDERSHIP_START}'",
+                "$group": "date",
+                "$order": "date",
+            },
+            os.path.join(mta_dir, f"subway-hourly-ridership-by-day-{dataset}.json"),
+        )
+    download_ny_open_data(
+        MTA_DAILY_RIDERSHIP_DATASET,
+        {
+            "$select": "date, count AS riders",
+            "$where": f"mode = 'Subway' AND date >= '{MTA_DAILY_RIDERSHIP_START}'",
+            "$order": "date",
+        },
+        os.path.join(mta_dir, "subway-daily-ridership.json"),
+    )
+
+    # The raw turnstile readings are too large to keep, so only the daily estimates
+    # computed from them are saved.
     turnstile_days = []
     month_start = MTA_TURNSTILE_START
     with tqdm(desc="turnstile months", unit="month") as pbar:
@@ -229,41 +270,11 @@ def download_nyc_subway(original_dir: str):
             month_start = next_month
             pbar.update()
 
-    rows = []
-    for dataset in MTA_SUBWAY_HOURLY_DATASETS:
-        rows += query_ny_open_data(
-            dataset,
-            {
-                "$select": "date_trunc_ymd(transit_timestamp) AS date, "
-                "sum(ridership) AS riders",
-                "$where": "transit_mode = 'subway' AND "
-                f"transit_timestamp >= '{MTA_SUBWAY_HOURLY_START}' AND "
-                f"transit_timestamp < '{MTA_DAILY_RIDERSHIP_START}'",
-                "$group": "date",
-            },
-        )
-    rows += query_ny_open_data(
-        MTA_DAILY_RIDERSHIP_DATASET,
-        {
-            "$select": "date, count AS riders",
-            "$where": f"mode = 'Subway' AND date >= '{MTA_DAILY_RIDERSHIP_START}'",
-        },
+    processed_mta_dir = os.path.join(processed_dir, "mta")
+    os.makedirs(processed_mta_dir, exist_ok=True)
+    pl.concat(turnstile_days).sort("date").write_csv(
+        os.path.join(processed_mta_dir, "subway-turnstile-daily-entries.csv")
     )
-
-    df = pl.concat(
-        [
-            *(days.cast({"riders": pl.Int64}) for days in turnstile_days),
-            pl.DataFrame(rows).select(
-                date=pl.col("date").str.to_datetime().dt.date(),
-                riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
-            ),
-        ]
-    ).sort("date")
-    assert df["date"].is_unique().all()
-
-    mta_dir = os.path.join(original_dir, "mta")
-    os.makedirs(mta_dir, exist_ok=True)
-    df.write_csv(os.path.join(mta_dir, "subway-daily-ridership.csv"))
 
 
 def download_dc_metro(original_dir: str):
@@ -274,6 +285,80 @@ def download_dc_metro(original_dir: str):
         os.path.join(wmata_dir, "rail-weekday-entries-by-month.csv"),
     )
     download_file(WMATA_DATA_RANGE_URL, os.path.join(wmata_dir, "data-range.csv"))
+
+
+def sound_transit_power_bi_key() -> str:
+    response = requests.get(SOUND_TRANSIT_RIDERSHIP_PAGE_URL)
+    response.raise_for_status()
+    match = POWER_BI_EMBED_RE.search(response.text)
+    if not match:
+        raise ValueError("No Power BI report found on the Sound Transit ridership page")
+    return json.loads(base64.b64decode(match[1]))["k"]
+
+
+def download_link_light_rail(original_dir: str):
+    key = sound_transit_power_bi_key()
+    headers = {"X-PowerBI-ResourceKey": key}
+    response = requests.get(
+        f"{POWER_BI_API_URL}/{key}/modelsAndExploration",
+        params={"preferReadOnlySession": "true"},
+        headers=headers,
+    )
+    response.raise_for_status()
+    model_id = response.json()["models"][0]["id"]
+
+    # Monthly boardings and average daily boardings for each mode and schedule type
+    source = {"SourceRef": {"Source": "m"}}
+    select = [
+        {"Column": {"Expression": source, "Property": "MonthRefDate"}},
+        {"Column": {"Expression": source, "Property": "Mode"}},
+        {"Column": {"Expression": source, "Property": "ScheduleType"}},
+        *(
+            {
+                "Aggregation": {
+                    "Expression": {"Column": {"Expression": source, "Property": p}},
+                    "Function": 0,
+                }
+            }
+            for p in ["AvgBdgsPerDay", "Boardings"]
+        ),
+    ]
+    for column, name in zip(select, SOUND_TRANSIT_MONTHLY_COLUMNS, strict=True):
+        column["Name"] = name
+    query = {
+        "Version": 2,
+        "From": [{"Name": "m", "Entity": "MonthlyMetrics", "Type": 0}],
+        "Select": select,
+    }
+    command = {
+        "Query": query,
+        "Binding": {
+            "Primary": {"Groupings": [{"Projections": list(range(len(select)))}]},
+            "DataReduction": {"DataVolume": 4, "Primary": {"Window": {"Count": 30000}}},
+            "Version": 1,
+        },
+    }
+    response = requests.post(
+        f"{POWER_BI_API_URL}/querydata",
+        params={"synchronous": "true"},
+        headers=headers,
+        json={
+            "version": "1.0.0",
+            "queries": [
+                {"Query": {"Commands": [{"SemanticQueryDataShapeCommand": command}]}}
+            ],
+            "modelId": model_id,
+        },
+    )
+    response.raise_for_status()
+    result = response.json()["results"][0]["result"]
+    if "error" in result:
+        raise ValueError(f"Power BI query failed: {result['error']}")
+
+    sound_transit_dir = os.path.join(original_dir, "sound-transit")
+    os.makedirs(sound_transit_dir, exist_ok=True)
+    with open(os.path.join(sound_transit_dir, "monthly-ridership.json"), "wb") as f:
+        f.write(response.content)
 
 
 def download_bart(original_dir: str):
@@ -289,19 +374,25 @@ def download_bart(original_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Download transit ridership data")
-    parser.add_argument("mode", choices=["bart", "dc-metro", "muni", "nyc-subway"])
+    parser.add_argument(
+        "mode", choices=["bart", "dc-metro", "link-light-rail", "muni", "nyc-subway"]
+    )
     args = parser.parse_args()
 
-    original_dir = original_data_dir()
+    data_repo = os.environ["DATA_REPO"]
+    original_dir = os.path.join(data_repo, "original")
+    processed_dir = os.path.join(data_repo, "processed")
     match args.mode:
         case "bart":
             download_bart(original_dir)
         case "dc-metro":
             download_dc_metro(original_dir)
+        case "link-light-rail":
+            download_link_light_rail(original_dir)
         case "muni":
             download_muni(original_dir)
         case "nyc-subway":
-            download_nyc_subway(original_dir)
+            download_nyc_subway(original_dir, processed_dir)
 
 
 if __name__ == "__main__":

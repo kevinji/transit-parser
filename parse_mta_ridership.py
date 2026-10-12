@@ -2,6 +2,31 @@ import holidays
 import polars as pl
 
 
+def combine_nyc_subway_daily_ridership(
+    turnstile_filename: str, query_filenames: list[str]
+) -> pl.DataFrame:
+    """
+    Combine the daily entries estimated from turnstile counters with the daily
+    ridership from the MTA's hourly and daily datasets, which cover later dates.
+    """
+    df = pl.concat(
+        [
+            pl.read_csv(turnstile_filename, try_parse_dates=True).cast(
+                {"riders": pl.Int64}
+            ),
+            *(
+                pl.read_json(filename).select(
+                    date=pl.col("date").str.to_datetime().dt.date(),
+                    riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
+                )
+                for filename in query_filenames
+            ),
+        ]
+    ).sort("date")
+    assert df["date"].is_unique().all()
+    return df
+
+
 def parse_nyc_subway_weekday_ridership(filename: str) -> pl.DataFrame:
     """
     Average the daily subway ridership over weekdays that aren't federal holidays for
