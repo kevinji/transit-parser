@@ -6,7 +6,7 @@ import orjson
 
 from parse_bart_ridership import parse_bart_weekday_ridership
 from parse_mta_ridership import parse_nyc_subway_weekday_ridership
-from parse_muni_ridership import parse_muni_weekday_ridership
+from parse_muni_ridership import parse_muni_metro_weekday_ridership
 from parse_wmata_ridership import parse_dc_metro_weekday_ridership
 
 BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?")
@@ -46,7 +46,7 @@ def generate_dc_metro(original_dir: str, generated_dir: str):
 
 
 def generate_muni(original_dir: str, generated_dir: str):
-    df = parse_muni_weekday_ridership(
+    df = parse_muni_metro_weekday_ridership(
         os.path.join(original_dir, "sfmta", "ridership.csv")
     )
     write_json(
