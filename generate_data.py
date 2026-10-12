@@ -7,6 +7,7 @@ import orjson
 from parse_bart_ridership import parse_bart_weekday_ridership
 from parse_mta_ridership import parse_nyc_subway_weekday_ridership
 from parse_muni_ridership import parse_muni_weekday_ridership
+from parse_wmata_ridership import parse_dc_metro_weekday_ridership
 
 BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?")
 
@@ -33,6 +34,17 @@ def generate_bart(original_dir: str, generated_dir: str):
     write_json(rows, os.path.join(generated_dir, "bart", "weekday-ridership.json"))
 
 
+def generate_dc_metro(original_dir: str, generated_dir: str):
+    wmata_dir = os.path.join(original_dir, "wmata")
+    df = parse_dc_metro_weekday_ridership(
+        os.path.join(wmata_dir, "rail-weekday-entries-by-month.csv"),
+        os.path.join(wmata_dir, "data-range.csv"),
+    )
+    write_json(
+        df.to_dicts(), os.path.join(generated_dir, "wmata", "weekday-ridership.json")
+    )
+
+
 def generate_muni(original_dir: str, generated_dir: str):
     df = parse_muni_weekday_ridership(
         os.path.join(original_dir, "sfmta", "ridership.csv")
@@ -55,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate chart data from ridership files"
     )
-    parser.add_argument("mode", choices=["bart", "muni", "nyc-subway"])
+    parser.add_argument("mode", choices=["bart", "dc-metro", "muni", "nyc-subway"])
     args = parser.parse_args()
 
     data_repo = os.environ["DATA_REPO"]
@@ -64,6 +76,8 @@ def main():
     match args.mode:
         case "bart":
             generate_bart(original_dir, generated_dir)
+        case "dc-metro":
+            generate_dc_metro(original_dir, generated_dir)
         case "muni":
             generate_muni(original_dir, generated_dir)
         case "nyc-subway":

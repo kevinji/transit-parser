@@ -27,6 +27,14 @@ MTA_DAILY_RIDERSHIP_START = "2020-03-01"
 # MTA Subway Hourly Ridership for 2017-2019 and 2020-2024
 MTA_SUBWAY_HOURLY_DATASETS = ["t69i-h2me", "wujg-7c2s"]
 
+# WMATA's Metrorail ridership dashboards are Tableau views, which can be exported as CSV.
+# The yearly dashboard's export only contains the date the data runs through.
+WMATA_RIDERSHIP_VIEWS_URL = "https://exttabanalytics.wmata.com/views/RidershipDataPortal-MetroRailRidershipSummary"
+WMATA_MONTHLY_ENTRIES_URL = (
+    f"{WMATA_RIDERSHIP_VIEWS_URL}/AvgDailyEntriesbyMonth.csv?Service%20Type=Weekday"
+)
+WMATA_DATA_RANGE_URL = f"{WMATA_RIDERSHIP_VIEWS_URL}/AvgWeekdayEntriesbyYear.csv"
+
 MONTH_NAMES = "|".join(calendar.month_name[1:])
 # Monthly files are named like `Ridership_202601.xlsx`, `Ridership_202401 1.xlsx`,
 # `Ridership_April2010.xlsx`, `Ridership_April 2008.xls`, or
@@ -177,6 +185,16 @@ def download_nyc_subway(original_dir: str):
     df.write_csv(os.path.join(mta_dir, "subway-daily-ridership.csv"))
 
 
+def download_dc_metro(original_dir: str):
+    wmata_dir = os.path.join(original_dir, "wmata")
+    os.makedirs(wmata_dir, exist_ok=True)
+    download_file(
+        WMATA_MONTHLY_ENTRIES_URL,
+        os.path.join(wmata_dir, "rail-weekday-entries-by-month.csv"),
+    )
+    download_file(WMATA_DATA_RANGE_URL, os.path.join(wmata_dir, "data-range.csv"))
+
+
 def download_bart(original_dir: str):
     bart_dir = os.path.join(original_dir, "bart")
     monthly_urls, yearly_zip_urls = find_bart_ridership_urls()
@@ -190,13 +208,15 @@ def download_bart(original_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Download transit ridership data")
-    parser.add_argument("mode", choices=["bart", "muni", "nyc-subway"])
+    parser.add_argument("mode", choices=["bart", "dc-metro", "muni", "nyc-subway"])
     args = parser.parse_args()
 
     original_dir = original_data_dir()
     match args.mode:
         case "bart":
             download_bart(original_dir)
+        case "dc-metro":
+            download_dc_metro(original_dir)
         case "muni":
             download_muni(original_dir)
         case "nyc-subway":
