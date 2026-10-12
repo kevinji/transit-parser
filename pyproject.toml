@@ -8,6 +8,7 @@ dependencies = [
     "fastexcel[polars,pyarrow]>=0.21",
     "holidays>=0.106",
     "orjson>=3.13",
+    "pdfplumber>=0.11",
     "polars>=2.0",
     "requests>=2.34",
     "tqdm>=4.70",

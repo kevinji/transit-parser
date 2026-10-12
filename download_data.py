@@ -50,6 +50,8 @@ WMATA_MONTHLY_ENTRIES_URL = (
 )
 WMATA_DATA_RANGE_URL = f"{WMATA_RIDERSHIP_VIEWS_URL}/AvgWeekdayEntriesbyYear.csv"
 
+MONTH_NAMES = "|".join(calendar.month_name[1:])
+
 # Sound Transit's ridership tracker is a public Power BI report. Its data can be queried
 # through the API that the embedded report uses, which needs the report's key from the
 # embed URL on the tracker page.
@@ -60,6 +62,14 @@ POWER_BI_EMBED_RE = re.compile(r"https://app\.powerbi\.com/view\?r=([A-Za-z0-9_=
 POWER_BI_API_URL = (
     "https://wabi-west-us-c-primary-api.analysis.windows.net/public/reports"
 )
+# Before 2019, Link ridership comes from Sound Transit's monthly service performance
+# reports, which are listed by the documents API behind the ridership documents page.
+SOUND_TRANSIT_DOCUMENTS_URL = (
+    "https://www.soundtransit.org/restful/media/by-topic/list.json?topic=549"
+)
+SOUND_TRANSIT_MONTHLY_REPORT_RE = re.compile(
+    rf"({MONTH_NAMES}) (\d{{4}}) ridership (?:report|summary)", re.IGNORECASE
+)
 SOUND_TRANSIT_MONTHLY_COLUMNS = [
     "MonthRefDate",
     "Mode",
@@ -68,7 +78,6 @@ SOUND_TRANSIT_MONTHLY_COLUMNS = [
     "Boardings",
 ]
 
-MONTH_NAMES = "|".join(calendar.month_name[1:])
 # Monthly files are named like `Ridership_202601.xlsx`, `Ridership_202401 1.xlsx`,
 # `Ridership_April2010.xlsx`, `Ridership_April 2008.xls`, or
 # `January 2001 Entry_Exit Matrices.xls`
@@ -296,7 +305,32 @@ def sound_transit_power_bi_key() -> str:
     return json.loads(base64.b64decode(match[1]))["k"]
 
 
+def download_sound_transit_monthly_reports(sound_transit_dir: str):
+    reports_dir = os.path.join(sound_transit_dir, "service-performance-reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    page = 0
+    while True:
+        response = requests.get(SOUND_TRANSIT_DOCUMENTS_URL, params={"page": page})
+        response.raise_for_status()
+        documents = response.json()["content"]
+        if not documents:
+            break
+        for document in documents:
+            match = SOUND_TRANSIT_MONTHLY_REPORT_RE.fullmatch(document["title"].strip())
+            if not match:
+                continue
+            month = list(calendar.month_name).index(match[1].capitalize())
+            download_file(
+                urljoin(SOUND_TRANSIT_DOCUMENTS_URL, document["file_url"]),
+                os.path.join(reports_dir, f"ridership-{match[2]}{month:02d}.pdf"),
+            )
+        page += 1
+
+
 def download_link_light_rail(original_dir: str):
+    sound_transit_dir = os.path.join(original_dir, "sound-transit")
+    download_sound_transit_monthly_reports(sound_transit_dir)
+
     key = sound_transit_power_bi_key()
     headers = {"X-PowerBI-ResourceKey": key}
     response = requests.get(
@@ -355,8 +389,6 @@ def download_link_light_rail(original_dir: str):
     if "error" in result:
         raise ValueError(f"Power BI query failed: {result['error']}")
 
-    sound_transit_dir = os.path.join(original_dir, "sound-transit")
-    os.makedirs(sound_transit_dir, exist_ok=True)
     with open(os.path.join(sound_transit_dir, "monthly-ridership.json"), "wb") as f:
         f.write(response.content)
 

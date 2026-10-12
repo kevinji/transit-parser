@@ -2,8 +2,10 @@ import argparse
 import glob
 import os
 import re
+from datetime import date
 
 import orjson
+import polars as pl
 
 from parse_bart_ridership import parse_bart_weekday_ridership
 from parse_mta_ridership import (
@@ -13,11 +15,13 @@ from parse_mta_ridership import (
 from parse_muni_ridership import parse_muni_metro_weekday_ridership
 from parse_sound_transit_ridership import (
     parse_link_light_rail_weekday_ridership,
+    parse_monthly_report_link_weekday_ridership,
     parse_sound_transit_monthly_ridership,
 )
 from parse_wmata_ridership import parse_dc_metro_weekday_ridership
 
 BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?")
+SOUND_TRANSIT_REPORT_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.pdf")
 
 
 def write_json(rows: list[dict], filename: str):
@@ -54,15 +58,34 @@ def generate_dc_metro(original_dir: str, generated_dir: str):
 
 
 def generate_link_light_rail(original_dir: str, processed_dir: str, generated_dir: str):
+    original_sound_transit_dir = os.path.join(original_dir, "sound-transit")
+    processed_sound_transit_dir = os.path.join(processed_dir, "sound-transit")
+    os.makedirs(processed_sound_transit_dir, exist_ok=True)
+
     monthly_filename = os.path.join(
-        processed_dir, "sound-transit", "monthly-ridership.csv"
+        processed_sound_transit_dir, "monthly-ridership.csv"
     )
-    os.makedirs(os.path.dirname(monthly_filename), exist_ok=True)
     parse_sound_transit_monthly_ridership(
-        os.path.join(original_dir, "sound-transit", "monthly-ridership.json")
+        os.path.join(original_sound_transit_dir, "monthly-ridership.json")
     ).write_csv(monthly_filename)
 
-    df = parse_link_light_rail_weekday_ridership(monthly_filename)
+    reports_dir = os.path.join(
+        original_sound_transit_dir, "service-performance-reports"
+    )
+    report_rows = []
+    for name in sorted(os.listdir(reports_dir)):
+        match = SOUND_TRANSIT_REPORT_FILE_RE.fullmatch(name)
+        if not match:
+            continue
+        report_rows += parse_monthly_report_link_weekday_ridership(
+            os.path.join(reports_dir, name), date(int(match[1]), int(match[2]), 1)
+        )
+    reports_filename = os.path.join(
+        processed_sound_transit_dir, "service-performance-reports-link-weekday.csv"
+    )
+    pl.DataFrame(report_rows).write_csv(reports_filename)
+
+    df = parse_link_light_rail_weekday_ridership(monthly_filename, reports_filename)
     write_json(
         df.to_dicts(),
         os.path.join(generated_dir, "sound-transit", "weekday-ridership.json"),
