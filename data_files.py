@@ -22,7 +22,7 @@ def open_compressed_writer(filename: str) -> Iterator[BinaryIO]:
     try:
         with (
             open(tmp_filename, "wb") as f,
-            zstandard.ZstdCompressor(level=19).stream_writer(f) as writer,
+            zstandard.ZstdCompressor(level=19, threads=-1).stream_writer(f) as writer,
         ):
             yield writer
         os.replace(tmp_filename, filename)

@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from data_files import (
     COMPRESSED_SUFFIX,
+    open_compressed,
     open_compressed_writer,
     read_compressed,
     write_compressed,
@@ -44,6 +45,8 @@ MTA_SUBWAY_HOURLY_START = date(2017, 2, 1)
 # onward. Their monthly weekday averages match the hourly datasets within 0.5%.
 MTA_TURNSTILE_DATASETS = ["i55r-43gk", "ug6q-shqc", "ekwu-khcy", "v5y5-mwpb"]
 MTA_TURNSTILE_START = date(2014, 2, 1)
+# NY Open Data times out on very large responses, so the datasets are downloaded in pages.
+MTA_TURNSTILE_DATASET_PAGE_SIZE = 1_000_000
 MTA_SUBWAY_DIVISIONS = ["IRT", "IND", "BMT"]
 # Before February 2014, the weekly turnstile files the MTA used to publish are only
 # available from the Internet Archive. They start in May 2010 and have no division
@@ -234,8 +237,10 @@ def turnstile_daily_entries_from_readings(
     first increase on start can be computed.
     """
     return (
-        readings.unique(["turnstile", "timestamp"])
-        .sort("turnstile", "timestamp")
+        # A few turnstiles report two counter values for the same time, e.g. around a
+        # counter reset, so keep the lower one to make the estimates reproducible.
+        readings.sort("turnstile", "timestamp", "entries")
+        .unique(["turnstile", "timestamp"], keep="first", maintain_order=True)
         # Some counters count down, so use the size of each change.
         .with_columns(increase=pl.col("entries").diff().over("turnstile").abs())
         .filter(pl.col("increase") <= MTA_TURNSTILE_MAX_ENTRIES_PER_READING)
@@ -245,29 +250,67 @@ def turnstile_daily_entries_from_readings(
     )
 
 
-def turnstile_daily_entries(start: date, end: date) -> pl.DataFrame:
-    """Estimate daily subway entries from start to end (exclusive)."""
-    divisions = ", ".join(f"'{division}'" for division in MTA_SUBWAY_DIVISIONS)
-    readings = []
-    for dataset in MTA_TURNSTILE_DATASETS:
-        csv = download_with_retries(
-            NY_OPEN_DATA_URL.format(dataset=dataset).removesuffix(".json") + ".csv",
-            params={
-                "$select": "c_a, unit, scp, date, time, entries",
-                "$where": f"division IN ({divisions}) AND "
-                f"date >= '{start - timedelta(days=1)}' AND date < '{end}'",
-                "$limit": "10000000",
-            },
-        )
-        readings.append(pl.read_csv(io.BytesIO(csv), infer_schema=False))
+def download_turnstile_dataset(dataset: str, filename: str):
+    """
+    Download all of a turnstile usage dataset as CSV. Datasets that were already
+    downloaded are reused.
+    """
+    if os.path.exists(filename):
+        return
+    url = NY_OPEN_DATA_URL.format(dataset=dataset).removesuffix(".json") + ".csv"
+    offset = 0
+    with (
+        open_compressed_writer(filename) as f,
+        tqdm(desc=dataset, unit="row", unit_scale=True) as pbar,
+    ):
+        while True:
+            page = download_with_retries(
+                url,
+                params={
+                    "$order": ":id",
+                    "$limit": str(MTA_TURNSTILE_DATASET_PAGE_SIZE),
+                    "$offset": str(offset),
+                },
+            )
+            header, _, rows = page.partition(b"\n")
+            if offset == 0:
+                f.write(header + b"\n")
+            f.write(rows)
+            row_count = rows.count(b"\n")
+            pbar.update(row_count)
+            if row_count < MTA_TURNSTILE_DATASET_PAGE_SIZE:
+                break
+            offset += MTA_TURNSTILE_DATASET_PAGE_SIZE
 
-    return turnstile_daily_entries_from_readings(
-        pl.concat(readings).select(
+
+def turnstile_dataset_readings(filename: str) -> pl.DataFrame:
+    """Get the subway readings before the hourly datasets from a turnstile dataset."""
+    return (
+        pl.read_csv(
+            open_compressed(filename),
+            columns=["c_a", "unit", "scp", "division", "date", "time", "entries"],
+            infer_schema=False,
+        )
+        .filter(pl.col("division").is_in(MTA_SUBWAY_DIVISIONS))
+        .select(
             turnstile=pl.concat_str("c_a", "unit", "scp", separator="/"),
             timestamp=(
                 pl.col("date").str.slice(0, 10) + " " + pl.col("time")
             ).str.to_datetime("%Y-%m-%d %H:%M:%S"),
             entries=pl.col("entries").cast(pl.Int64),
+        )
+        .filter(pl.col("timestamp").dt.date() < MTA_SUBWAY_HOURLY_START)
+    )
+
+
+def turnstile_daily_entries(
+    start: date, end: date, readings: pl.DataFrame
+) -> pl.DataFrame:
+    """Estimate daily subway entries from start to end (exclusive)."""
+    return turnstile_daily_entries_from_readings(
+        readings.filter(
+            pl.col("timestamp").dt.date() >= start - timedelta(days=1),
+            pl.col("timestamp").dt.date() < end,
         ),
         start,
     )
@@ -462,9 +505,6 @@ def download_nyc_subway(original_dir: str, processed_dir: str):
         os.path.join(mta_dir, "subway-daily-ridership.json" + COMPRESSED_SUFFIX),
     )
 
-    # The archived turnstile files are saved since they're no longer published. The
-    # turnstile datasets are still published, so only the daily estimates computed
-    # from them are saved.
     turnstile_dir = os.path.join(mta_dir, "turnstile")
     os.makedirs(turnstile_dir, exist_ok=True)
     filenames = download_archived_turnstile_files(
@@ -483,12 +523,22 @@ def download_nyc_subway(original_dir: str, processed_dir: str):
             )
             month_start = next_month
 
-    with tqdm(desc="turnstile months", unit="month") as pbar:
-        while month_start < MTA_SUBWAY_HOURLY_START:
-            next_month = (month_start + timedelta(days=32)).replace(day=1)
-            turnstile_days.append(turnstile_daily_entries(month_start, next_month))
-            month_start = next_month
-            pbar.update()
+    dataset_filenames = []
+    for dataset in MTA_TURNSTILE_DATASETS:
+        filename = os.path.join(
+            turnstile_dir, f"turnstile-usage-{dataset}.csv" + COMPRESSED_SUFFIX
+        )
+        download_turnstile_dataset(dataset, filename)
+        dataset_filenames.append(filename)
+    readings = pl.concat(
+        turnstile_dataset_readings(filename) for filename in dataset_filenames
+    )
+    while month_start < MTA_SUBWAY_HOURLY_START:
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        turnstile_days.append(
+            turnstile_daily_entries(month_start, next_month, readings)
+        )
+        month_start = next_month
 
     processed_mta_dir = os.path.join(processed_dir, "mta")
     os.makedirs(processed_mta_dir, exist_ok=True)
