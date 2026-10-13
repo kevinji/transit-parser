@@ -3,12 +3,13 @@ from datetime import date
 
 import polars as pl
 
+from data_files import open_compressed, read_compressed
+
 DATA_THROUGH_RE = re.compile(r"Showing Data Through (\d{1,2})/(\d{1,2})/(\d{4})")
 
 
 def parse_data_through(filename: str) -> date:
-    with open(filename, encoding="utf-8-sig") as f:
-        match = DATA_THROUGH_RE.search(f.read())
+    match = DATA_THROUGH_RE.search(read_compressed(filename).decode("utf-8-sig"))
     if not match:
         raise ValueError(f"No data range found in {filename}")
     return date(int(match[3]), int(match[1]), int(match[2]))
@@ -25,7 +26,7 @@ def parse_dc_metro_weekday_ridership(
     """
     data_through = parse_data_through(data_range_filename)
     return (
-        pl.read_csv(entries_filename)
+        pl.read_csv(open_compressed(entries_filename))
         .select(
             month_start=pl.concat_str(
                 pl.col("Year of Date").cast(pl.String),

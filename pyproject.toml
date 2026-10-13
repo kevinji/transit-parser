@@ -12,6 +12,7 @@ dependencies = [
     "polars>=2.0",
     "requests>=2.34",
     "tqdm>=4.70",
+    "zstandard>=0.25",
 ]
 
 [tool.setuptools]

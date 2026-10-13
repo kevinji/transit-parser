@@ -1,6 +1,8 @@
 import holidays
 import polars as pl
 
+from data_files import open_compressed
+
 
 def combine_nyc_subway_daily_ridership(
     turnstile_filename: str, query_filenames: list[str]
@@ -15,7 +17,7 @@ def combine_nyc_subway_daily_ridership(
                 {"riders": pl.Int64}
             ),
             *(
-                pl.read_json(filename).select(
+                pl.read_json(open_compressed(filename)).select(
                     date=pl.col("date").str.to_datetime().dt.date(),
                     riders=pl.col("riders").cast(pl.Float64).round().cast(pl.Int64),
                 )

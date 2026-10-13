@@ -5,7 +5,6 @@ import io
 import json
 import os
 import re
-import shutil
 import tempfile
 import time
 import zipfile
@@ -15,6 +14,13 @@ from urllib.parse import unquote, urljoin, urlparse
 import polars as pl
 import requests
 from tqdm import tqdm
+
+from data_files import (
+    COMPRESSED_SUFFIX,
+    open_compressed_writer,
+    read_compressed,
+    write_compressed,
+)
 
 SFMTA_MUNI_RIDERSHIP_URL = (
     "https://transtat.sfmta.com/t/public/views/Goal2Dashboards/RidershipTable.csv"
@@ -102,13 +108,14 @@ BART_YEARLY_ZIP_RE = re.compile(r"ridership_(?:OD_)?(\d{4})\.zip$", re.IGNORECAS
 
 
 def download_file(url: str, filename: str):
+    """Download a file, saving it zstd-compressed."""
     response = requests.get(url, stream=True)
     response.raise_for_status()
 
     total_size = int(response.headers.get("content-length", 0))
 
     with (
-        open(filename, "wb") as f,
+        open_compressed_writer(filename) as f,
         tqdm(
             desc=os.path.basename(filename),
             total=total_size,
@@ -160,28 +167,25 @@ def find_bart_ridership_urls() -> tuple[list[str], list[str]]:
 
 
 def download_bart_yearly_zip(url: str, bart_dir: str):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zip_filename = os.path.join(tmp_dir, os.path.basename(url))
-        download_file(url, zip_filename)
+    response = requests.get(url)
+    response.raise_for_status()
 
-        with zipfile.ZipFile(zip_filename) as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                filename = bart_ridership_filename(os.path.basename(info.filename))
-                if not filename:
-                    raise ValueError(f"Unrecognized file {info.filename!r} in {url}")
-                with (
-                    zf.open(info) as src,
-                    open(os.path.join(bart_dir, filename), "wb") as dst,
-                ):
-                    shutil.copyfileobj(src, dst)
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            filename = bart_ridership_filename(os.path.basename(info.filename))
+            if not filename:
+                raise ValueError(f"Unrecognized file {info.filename!r} in {url}")
+            write_compressed(
+                os.path.join(bart_dir, filename + COMPRESSED_SUFFIX), zf.read(info)
+            )
 
 
 def download_muni(original_dir: str):
     download_file(
         SFMTA_MUNI_RIDERSHIP_URL,
-        os.path.join(original_dir, "sfmta", "ridership.csv"),
+        os.path.join(original_dir, "sfmta", "ridership.csv" + COMPRESSED_SUFFIX),
     )
 
 
@@ -198,8 +202,7 @@ def download_ny_open_data(dataset: str, params: dict[str, str], filename: str):
     content = download_with_retries(
         NY_OPEN_DATA_URL.format(dataset=dataset), params={"$limit": "50000", **params}
     )
-    with open(filename, "wb") as f:
-        f.write(content)
+    write_compressed(filename, content)
 
 
 def download_with_retries(
@@ -319,50 +322,31 @@ def non_subway_turnstile_units() -> set[str]:
     }
 
 
-def read_archived_turnstile_file(filename: str) -> pl.DataFrame:
+def parse_archived_turnstile_file(content: bytes) -> pl.DataFrame:
     """
-    Read the readings from a turnstile file in the format used before October 2014,
+    Parse the readings from a turnstile file in the format used before October 2014,
     where each line has a turnstile's C/A, unit, and SCP followed by up to 8 readings
     of date, time, description, entries, and exits.
     """
     rows = []
-    with open(filename) as f:
-        for line in f:
-            fields = [field.strip() for field in line.split(",")]
-            for i in range(3, len(fields) - 4, 5):
-                reading = (*fields[:3], fields[i], fields[i + 1], fields[i + 3])
-                # A few lines in some files are corrupted, with fields out of place.
-                if ARCHIVED_TURNSTILE_READING_RE.fullmatch(",".join(reading[3:])):
-                    rows.append(reading)
+    for line in content.decode().splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        for i in range(3, len(fields) - 4, 5):
+            reading = (*fields[:3], fields[i], fields[i + 1], fields[i + 3])
+            # A few lines in some files are corrupted, with fields out of place.
+            if ARCHIVED_TURNSTILE_READING_RE.fullmatch(",".join(reading[3:])):
+                rows.append(reading)
     return pl.DataFrame(
         rows, schema=["c_a", "unit", "scp", "date", "time", "entries"], orient="row"
     )
 
 
-def download_archived_turnstile_file(
-    url: str, excluded_units: set[str], readings_dir: str
-) -> tuple[date, date, str]:
-    """
-    Download an archived weekly file and save its subway readings as Parquet. Returns
-    the first and last reading dates along with the saved file's path, since file
-    dates don't always match the week a file covers.
-    """
-    filename = os.path.join(readings_dir, url_basename(url))
-    parquet_filename = filename.removesuffix(".txt") + ".parquet"
-    if os.path.exists(parquet_filename):
-        timestamps = pl.read_parquet(parquet_filename, columns=["timestamp"])
-        return (
-            timestamps["timestamp"].min().date(),
-            timestamps["timestamp"].max().date(),
-            parquet_filename,
-        )
-
-    # The Internet Archive refuses connections for a few minutes when it's sent too
-    # many requests, so wait longer between attempts.
-    with open(filename, "wb") as f:
-        f.write(download_with_retries(url, {}, attempts=6, delay=60))
-    readings = (
-        read_archived_turnstile_file(filename)
+def archived_turnstile_readings(
+    filename: str, excluded_units: set[str]
+) -> pl.DataFrame:
+    """Get the subway readings from an archived weekly file."""
+    return (
+        parse_archived_turnstile_file(read_compressed(filename))
         .filter(~pl.col("unit").is_in(excluded_units))
         .select(
             turnstile=pl.concat_str("c_a", "unit", "scp", separator="/"),
@@ -372,29 +356,62 @@ def download_archived_turnstile_file(
             entries=pl.col("entries").cast(pl.Int64),
         )
     )
-    os.remove(filename)
-    first_date = readings["timestamp"].min().date()
-    last_date = readings["timestamp"].max().date()
-    # Truncated captures only cover part of a week.
-    if last_date - first_date < timedelta(days=5):
-        raise ValueError(f"{url} only covers {first_date} to {last_date}")
-    readings.write_parquet(parquet_filename)
-    return first_date, last_date, parquet_filename
 
 
-def download_archived_turnstile_readings(
-    file_urls: dict[date, str], excluded_units: set[str], readings_dir: str
+def download_archived_turnstile_files(
+    file_urls: dict[date, str], turnstile_dir: str
+) -> list[str]:
+    """
+    Download the archived weekly files before the 2014 dataset. Files that were
+    already downloaded are reused. The Internet Archive blocks clients that make
+    too many requests at once, so files are downloaded one at a time.
+    """
+    filenames = []
+    for file_date, url in tqdm(sorted(file_urls.items()), desc="archived files"):
+        if file_date > MTA_TURNSTILE_START + timedelta(days=7):
+            continue
+        filename = os.path.join(turnstile_dir, url_basename(url) + COMPRESSED_SUFFIX)
+        filenames.append(filename)
+        if os.path.exists(filename):
+            continue
+        # The Internet Archive refuses connections for a few minutes when it's sent too
+        # many requests, so wait longer between attempts.
+        content = download_with_retries(url, {}, attempts=6, delay=60)
+        dates = parse_archived_turnstile_file(content)["date"].str.to_date("%m-%d-%y")
+        first_date, last_date = dates.min(), dates.max()
+        # Truncated captures only cover part of a week.
+        if last_date - first_date < timedelta(days=5):
+            raise ValueError(f"{url} only covers {first_date} to {last_date}")
+        write_compressed(filename, content)
+    return filenames
+
+
+def save_archived_turnstile_readings(
+    filenames: list[str], excluded_units: set[str], readings_dir: str
 ) -> list[tuple[date, date, str]]:
     """
-    Download the archived weekly files before the 2014 dataset. The Internet Archive
-    blocks clients that make too many requests at once, so files are downloaded one at
-    a time. Files already saved in readings_dir are reused.
+    Save the subway readings from each archived weekly file as Parquet, so that each
+    month only needs to load the weeks around it. Returns each file's first and last
+    reading dates along with the saved file's path, since file dates don't always
+    match the week a file covers.
     """
-    return [
-        download_archived_turnstile_file(url, excluded_units, readings_dir)
-        for file_date, url in tqdm(sorted(file_urls.items()), desc="archived files")
-        if file_date <= MTA_TURNSTILE_START + timedelta(days=7)
-    ]
+    files = []
+    for filename in tqdm(filenames, desc="archived readings"):
+        readings = archived_turnstile_readings(filename, excluded_units)
+        parquet_filename = os.path.join(
+            readings_dir,
+            os.path.basename(filename).removesuffix(".txt" + COMPRESSED_SUFFIX)
+            + ".parquet",
+        )
+        readings.write_parquet(parquet_filename)
+        files.append(
+            (
+                readings["timestamp"].min().date(),
+                readings["timestamp"].max().date(),
+                parquet_filename,
+            )
+        )
+    return files
 
 
 def archived_turnstile_daily_entries(
@@ -430,7 +447,10 @@ def download_nyc_subway(original_dir: str, processed_dir: str):
                 "$group": "date",
                 "$order": "date",
             },
-            os.path.join(mta_dir, f"subway-hourly-ridership-by-day-{dataset}.json"),
+            os.path.join(
+                mta_dir,
+                f"subway-hourly-ridership-by-day-{dataset}.json" + COMPRESSED_SUFFIX,
+            ),
         )
     download_ny_open_data(
         MTA_DAILY_RIDERSHIP_DATASET,
@@ -439,15 +459,21 @@ def download_nyc_subway(original_dir: str, processed_dir: str):
             "$where": f"mode = 'Subway' AND date >= '{MTA_DAILY_RIDERSHIP_START}'",
             "$order": "date",
         },
-        os.path.join(mta_dir, "subway-daily-ridership.json"),
+        os.path.join(mta_dir, "subway-daily-ridership.json" + COMPRESSED_SUFFIX),
     )
 
-    # The raw turnstile readings are too large to keep, so only the daily estimates
-    # computed from them are saved.
+    # The archived turnstile files are saved since they're no longer published. The
+    # turnstile datasets are still published, so only the daily estimates computed
+    # from them are saved.
+    turnstile_dir = os.path.join(mta_dir, "turnstile")
+    os.makedirs(turnstile_dir, exist_ok=True)
+    filenames = download_archived_turnstile_files(
+        archived_turnstile_file_urls(), turnstile_dir
+    )
     turnstile_days = []
     with tempfile.TemporaryDirectory() as readings_dir:
-        files = download_archived_turnstile_readings(
-            archived_turnstile_file_urls(), non_subway_turnstile_units(), readings_dir
+        files = save_archived_turnstile_readings(
+            filenames, non_subway_turnstile_units(), readings_dir
         )
         month_start = min(first_date for first_date, _, _ in files).replace(day=1)
         while month_start < MTA_TURNSTILE_START:
@@ -476,9 +502,14 @@ def download_dc_metro(original_dir: str):
     os.makedirs(wmata_dir, exist_ok=True)
     download_file(
         WMATA_MONTHLY_ENTRIES_URL,
-        os.path.join(wmata_dir, "rail-weekday-entries-by-month.csv"),
+        os.path.join(
+            wmata_dir, "rail-weekday-entries-by-month.csv" + COMPRESSED_SUFFIX
+        ),
     )
-    download_file(WMATA_DATA_RANGE_URL, os.path.join(wmata_dir, "data-range.csv"))
+    download_file(
+        WMATA_DATA_RANGE_URL,
+        os.path.join(wmata_dir, "data-range.csv" + COMPRESSED_SUFFIX),
+    )
 
 
 def sound_transit_power_bi_key() -> str:
@@ -507,7 +538,10 @@ def download_sound_transit_monthly_reports(sound_transit_dir: str):
             month = list(calendar.month_name).index(match[1].capitalize())
             download_file(
                 urljoin(SOUND_TRANSIT_DOCUMENTS_URL, document["file_url"]),
-                os.path.join(reports_dir, f"ridership-{match[2]}{month:02d}.pdf"),
+                os.path.join(
+                    reports_dir,
+                    f"ridership-{match[2]}{month:02d}.pdf" + COMPRESSED_SUFFIX,
+                ),
             )
         page += 1
 
@@ -574,8 +608,10 @@ def download_link_light_rail(original_dir: str):
     if "error" in result:
         raise ValueError(f"Power BI query failed: {result['error']}")
 
-    with open(os.path.join(sound_transit_dir, "monthly-ridership.json"), "wb") as f:
-        f.write(response.content)
+    write_compressed(
+        os.path.join(sound_transit_dir, "monthly-ridership.json" + COMPRESSED_SUFFIX),
+        response.content,
+    )
 
 
 def download_bart(original_dir: str):
@@ -586,7 +622,7 @@ def download_bart(original_dir: str):
     for url in monthly_urls:
         filename = bart_ridership_filename(url_basename(url))
         assert filename
-        download_file(url, os.path.join(bart_dir, filename))
+        download_file(url, os.path.join(bart_dir, filename + COMPRESSED_SUFFIX))
 
 
 def main():
@@ -594,11 +630,15 @@ def main():
     parser.add_argument(
         "mode", choices=["bart", "dc-metro", "link-light-rail", "muni", "nyc-subway"]
     )
+    parser.add_argument(
+        "--data-dir",
+        default="../transit-data",
+        help="directory for the original and processed data (default: ../transit-data)",
+    )
     args = parser.parse_args()
 
-    data_repo = os.environ["DATA_REPO"]
-    original_dir = os.path.join(data_repo, "original")
-    processed_dir = os.path.join(data_repo, "processed")
+    original_dir = os.path.join(args.data_dir, "original")
+    processed_dir = os.path.join(args.data_dir, "processed")
     match args.mode:
         case "bart":
             download_bart(original_dir)

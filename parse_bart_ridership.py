@@ -3,6 +3,8 @@ import re
 import fastexcel
 import polars as pl
 
+from data_files import read_compressed
+
 STATION_CODE_RE = re.compile(r"^[A-Z0-9]{2}$")
 WEEKDAY_SHEET_RE = re.compile(r"weekday|wkdy", re.IGNORECASE)
 
@@ -119,7 +121,7 @@ def parse_station_code(code: str) -> str:
 
 def parse_bart_ridership(filename: str) -> pl.DataFrame:
     return pl.read_excel(
-        filename,
+        read_compressed(filename),
         sheet_name="Total Trips",
         read_options={
             "header_row": 3,
@@ -138,7 +140,7 @@ def parse_bart_weekday_ridership(filename: str) -> float:
     of entry station codes and sums the cells whose row and column are both station
     codes, which skips any entry/exit total rows and columns.
     """
-    reader = fastexcel.read_excel(filename)
+    reader = fastexcel.read_excel(read_compressed(filename))
     sheet_name = next(
         name for name in reader.sheet_names if WEEKDAY_SHEET_RE.search(name)
     )

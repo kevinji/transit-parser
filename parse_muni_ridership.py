@@ -1,5 +1,7 @@
 import polars as pl
 
+from data_files import open_compressed
+
 
 def parse_muni_metro_weekday_ridership(filename: str) -> pl.DataFrame:
     """
@@ -8,7 +10,7 @@ def parse_muni_metro_weekday_ridership(filename: str) -> pl.DataFrame:
     those months; they are filled in as zero.
     """
     weekdays = (
-        pl.read_csv(filename)
+        pl.read_csv(open_compressed(filename))
         .filter(pl.col("Service Day of the Week") == "WEEKDAY")
         .select(
             date=pl.col("Month").str.to_date("%B %Y"),

@@ -7,6 +7,7 @@ from datetime import date
 import orjson
 import polars as pl
 
+from data_files import COMPRESSED_SUFFIX
 from parse_bart_ridership import parse_bart_weekday_ridership
 from parse_mta_ridership import (
     combine_nyc_subway_daily_ridership,
@@ -20,8 +21,8 @@ from parse_sound_transit_ridership import (
 )
 from parse_wmata_ridership import parse_dc_metro_weekday_ridership
 
-BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?")
-SOUND_TRANSIT_REPORT_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.pdf")
+BART_RIDERSHIP_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.xlsx?\.zst")
+SOUND_TRANSIT_REPORT_FILE_RE = re.compile(r"ridership-(\d{4})(\d{2})\.pdf\.zst")
 
 
 def write_json(rows: list[dict], filename: str):
@@ -49,8 +50,10 @@ def generate_bart(original_dir: str, generated_dir: str):
 def generate_dc_metro(original_dir: str, generated_dir: str):
     wmata_dir = os.path.join(original_dir, "wmata")
     df = parse_dc_metro_weekday_ridership(
-        os.path.join(wmata_dir, "rail-weekday-entries-by-month.csv"),
-        os.path.join(wmata_dir, "data-range.csv"),
+        os.path.join(
+            wmata_dir, "rail-weekday-entries-by-month.csv" + COMPRESSED_SUFFIX
+        ),
+        os.path.join(wmata_dir, "data-range.csv" + COMPRESSED_SUFFIX),
     )
     write_json(
         df.to_dicts(), os.path.join(generated_dir, "wmata", "weekday-ridership.json")
@@ -66,7 +69,9 @@ def generate_link_light_rail(original_dir: str, processed_dir: str, generated_di
         processed_sound_transit_dir, "monthly-ridership.csv"
     )
     parse_sound_transit_monthly_ridership(
-        os.path.join(original_sound_transit_dir, "monthly-ridership.json")
+        os.path.join(
+            original_sound_transit_dir, "monthly-ridership.json" + COMPRESSED_SUFFIX
+        )
     ).write_csv(monthly_filename)
 
     reports_dir = os.path.join(
@@ -94,7 +99,7 @@ def generate_link_light_rail(original_dir: str, processed_dir: str, generated_di
 
 def generate_muni(original_dir: str, generated_dir: str):
     df = parse_muni_metro_weekday_ridership(
-        os.path.join(original_dir, "sfmta", "ridership.csv")
+        os.path.join(original_dir, "sfmta", "ridership.csv" + COMPRESSED_SUFFIX)
     )
     write_json(
         df.to_dicts(), os.path.join(generated_dir, "sfmta", "weekday-ridership.json")
@@ -105,7 +110,7 @@ def generate_nyc_subway(original_dir: str, processed_dir: str, generated_dir: st
     daily_filename = os.path.join(processed_dir, "mta", "subway-daily-ridership.csv")
     combine_nyc_subway_daily_ridership(
         os.path.join(processed_dir, "mta", "subway-turnstile-daily-entries.csv"),
-        sorted(glob.glob(os.path.join(original_dir, "mta", "*.json"))),
+        sorted(glob.glob(os.path.join(original_dir, "mta", "*.json.zst"))),
     ).write_csv(daily_filename)
 
     df = parse_nyc_subway_weekday_ridership(daily_filename)
@@ -121,12 +126,21 @@ def main():
     parser.add_argument(
         "mode", choices=["bart", "dc-metro", "link-light-rail", "muni", "nyc-subway"]
     )
+    parser.add_argument(
+        "--data-dir",
+        default="../transit-data",
+        help="directory for the original and processed data (default: ../transit-data)",
+    )
+    parser.add_argument(
+        "--charts-data-dir",
+        default="../transit-charts/data",
+        help="directory to write the chart data to (default: ../transit-charts/data)",
+    )
     args = parser.parse_args()
 
-    data_repo = os.environ["DATA_REPO"]
-    original_dir = os.path.join(data_repo, "original")
-    processed_dir = os.path.join(data_repo, "processed")
-    generated_dir = os.path.join(data_repo, "generated")
+    original_dir = os.path.join(args.data_dir, "original")
+    processed_dir = os.path.join(args.data_dir, "processed")
+    generated_dir = args.charts_data_dir
     match args.mode:
         case "bart":
             generate_bart(original_dir, generated_dir)

@@ -5,6 +5,8 @@ import orjson
 import pdfplumber
 import polars as pl
 
+from data_files import open_compressed, read_compressed
+
 
 def decode_power_bi_rows(data: dict) -> list[list]:
     """
@@ -43,8 +45,7 @@ def parse_sound_transit_monthly_ridership(filename: str) -> pl.DataFrame:
     ran in is divided by all of the month's days even though only some have data, so
     only months before it are kept.
     """
-    with open(filename, "rb") as f:
-        data = orjson.loads(f.read())["results"][0]["result"]["data"]
+    data = orjson.loads(read_compressed(filename))["results"][0]["result"]["data"]
     queried_month = datetime.fromisoformat(data["timestamp"]).date().replace(day=1)
     return (
         pl.DataFrame(
@@ -104,7 +105,7 @@ def parse_monthly_report_link_weekday_ridership(
     have one row per mode with the current year first, where the weekday averages
     follow the monthly and year-to-date totals.
     """
-    with pdfplumber.open(filename) as pdf:
+    with pdfplumber.open(open_compressed(filename)) as pdf:
         text = pdf.pages[0].extract_text(layout=True)
     # Some reports split numbers like "30,509" into "3 0,509".
     text = re.sub(r"(?<![\d,])(\d) (?=\d{1,2},\d{3}\b)", r"\1", text)
