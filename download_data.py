@@ -39,6 +39,15 @@ MTA_SUBWAY_HOURLY_START = date(2017, 2, 1)
 MTA_TURNSTILE_DATASETS = ["i55r-43gk", "ug6q-shqc", "ekwu-khcy", "v5y5-mwpb"]
 MTA_TURNSTILE_START = date(2014, 2, 1)
 MTA_SUBWAY_DIVISIONS = ["IRT", "IND", "BMT"]
+# Before February 2014, the weekly turnstile files the MTA used to publish are only
+# available from the Internet Archive. They start in May 2010 and have no division
+# column, so units that the 2014 dataset only lists outside the subway divisions (PATH,
+# Staten Island Railway, and the Roosevelt Island Tram) are excluded.
+MTA_TURNSTILE_FILES_URL = "http://web.mta.info/developers/data/nyct/turnstile/"
+MTA_TURNSTILE_FILE_RE = re.compile(r"turnstile_(\d{2})(\d{2})(\d{2})\.txt")
+ARCHIVED_TURNSTILE_READING_RE = re.compile(r"\d{2}-\d{2}-\d{2},\d{2}:\d{2}:\d{2},\d+")
+WAYBACK_CDX_URL = "https://web.archive.org/cdx/search/cdx"
+WAYBACK_RAW_URL = "https://web.archive.org/web/{timestamp}id_/{url}"
 # Larger jumps between readings are counter resets or errors rather than entries.
 MTA_TURNSTILE_MAX_ENTRIES_PER_READING = 5000
 
@@ -176,6 +185,15 @@ def download_muni(original_dir: str):
     )
 
 
+def query_ny_open_data(dataset: str, params: dict[str, str]) -> list[dict]:
+    return json.loads(
+        download_with_retries(
+            NY_OPEN_DATA_URL.format(dataset=dataset),
+            params={"$limit": "50000", **params},
+        )
+    )
+
+
 def download_ny_open_data(dataset: str, params: dict[str, str], filename: str):
     content = download_with_retries(
         NY_OPEN_DATA_URL.format(dataset=dataset), params={"$limit": "50000", **params}
@@ -184,10 +202,13 @@ def download_ny_open_data(dataset: str, params: dict[str, str], filename: str):
         f.write(content)
 
 
-def download_with_retries(url: str, params: dict[str, str], attempts: int = 5) -> bytes:
+def download_with_retries(
+    url: str, params: dict[str, str], attempts: int = 5, delay: int = 10
+) -> bytes:
     """
-    Download a response body, retrying on errors. NY Open Data sometimes times out
-    partway through a large response, which `requests`' own retries don't cover.
+    Download a response body, retrying on errors with a growing delay in seconds. NY
+    Open Data sometimes times out partway through a large response, which `requests`'
+    own retries don't cover.
     """
     for attempt in range(1, attempts + 1):
         try:
@@ -197,16 +218,32 @@ def download_with_retries(url: str, params: dict[str, str], attempts: int = 5) -
         except requests.RequestException:
             if attempt == attempts:
                 raise
-            time.sleep(10 * attempt)
+            time.sleep(delay * attempt)
     raise AssertionError("unreachable")
 
 
+def turnstile_daily_entries_from_readings(
+    readings: pl.DataFrame, start: date
+) -> pl.DataFrame:
+    """
+    Estimate daily subway entries by summing the increases in each turnstile's
+    cumulative entry counter. Readings should start the day before start so that the
+    first increase on start can be computed.
+    """
+    return (
+        readings.unique(["turnstile", "timestamp"])
+        .sort("turnstile", "timestamp")
+        # Some counters count down, so use the size of each change.
+        .with_columns(increase=pl.col("entries").diff().over("turnstile").abs())
+        .filter(pl.col("increase") <= MTA_TURNSTILE_MAX_ENTRIES_PER_READING)
+        .group_by(date=pl.col("timestamp").dt.date())
+        .agg(riders=pl.col("increase").sum())
+        .filter(pl.col("date") >= start)
+    )
+
+
 def turnstile_daily_entries(start: date, end: date) -> pl.DataFrame:
-    """
-    Estimate daily subway entries from start to end (exclusive) by summing the
-    increases in each turnstile's cumulative entry counter. Readings from the day
-    before start are included so that the first increase on start can be computed.
-    """
+    """Estimate daily subway entries from start to end (exclusive)."""
     divisions = ", ".join(f"'{division}'" for division in MTA_SUBWAY_DIVISIONS)
     readings = []
     for dataset in MTA_TURNSTILE_DATASETS:
@@ -221,23 +258,160 @@ def turnstile_daily_entries(start: date, end: date) -> pl.DataFrame:
         )
         readings.append(pl.read_csv(io.BytesIO(csv), infer_schema=False))
 
-    return (
-        pl.concat(readings)
-        .select(
+    return turnstile_daily_entries_from_readings(
+        pl.concat(readings).select(
             turnstile=pl.concat_str("c_a", "unit", "scp", separator="/"),
             timestamp=(
                 pl.col("date").str.slice(0, 10) + " " + pl.col("time")
             ).str.to_datetime("%Y-%m-%d %H:%M:%S"),
             entries=pl.col("entries").cast(pl.Int64),
+        ),
+        start,
+    )
+
+
+def archived_turnstile_file_urls() -> dict[date, str]:
+    """
+    Find the weekly turnstile files in the Internet Archive, keyed by file date. Some
+    captures are truncated, so each file uses its largest capture.
+    """
+    cdx = download_with_retries(
+        WAYBACK_CDX_URL,
+        {
+            "url": MTA_TURNSTILE_FILES_URL + "turnstile_",
+            "matchType": "prefix",
+            "filter": "statuscode:200",
+            "fl": "timestamp,original,length",
+        },
+        attempts=6,
+        delay=60,
+    )
+    captures: dict[date, tuple[int, str]] = {}
+    for line in cdx.decode().splitlines():
+        timestamp, url, length = line.split()
+        match = MTA_TURNSTILE_FILE_RE.search(url)
+        if not match:
+            continue
+        file_date = date(2000 + int(match[1]), int(match[2]), int(match[3]))
+        if file_date not in captures or int(length) > captures[file_date][0]:
+            captures[file_date] = (
+                int(length),
+                WAYBACK_RAW_URL.format(
+                    timestamp=timestamp, url=MTA_TURNSTILE_FILES_URL + match[0]
+                ),
+            )
+    return {file_date: url for file_date, (_, url) in captures.items()}
+
+
+def non_subway_turnstile_units() -> set[str]:
+    """Units that the 2014 turnstile dataset only lists outside the subway."""
+    rows = query_ny_open_data(
+        MTA_TURNSTILE_DATASETS[0],
+        {"$select": "unit, division", "$group": "unit, division"},
+    )
+    divisions_by_unit: dict[str, set[str]] = {}
+    for row in rows:
+        divisions_by_unit.setdefault(row["unit"], set()).add(row["division"])
+    return {
+        unit
+        for unit, divisions in divisions_by_unit.items()
+        if divisions.isdisjoint(MTA_SUBWAY_DIVISIONS)
+    }
+
+
+def read_archived_turnstile_file(filename: str) -> pl.DataFrame:
+    """
+    Read the readings from a turnstile file in the format used before October 2014,
+    where each line has a turnstile's C/A, unit, and SCP followed by up to 8 readings
+    of date, time, description, entries, and exits.
+    """
+    rows = []
+    with open(filename) as f:
+        for line in f:
+            fields = [field.strip() for field in line.split(",")]
+            for i in range(3, len(fields) - 4, 5):
+                reading = (*fields[:3], fields[i], fields[i + 1], fields[i + 3])
+                # A few lines in some files are corrupted, with fields out of place.
+                if ARCHIVED_TURNSTILE_READING_RE.fullmatch(",".join(reading[3:])):
+                    rows.append(reading)
+    return pl.DataFrame(
+        rows, schema=["c_a", "unit", "scp", "date", "time", "entries"], orient="row"
+    )
+
+
+def download_archived_turnstile_file(
+    url: str, excluded_units: set[str], readings_dir: str
+) -> tuple[date, date, str]:
+    """
+    Download an archived weekly file and save its subway readings as Parquet. Returns
+    the first and last reading dates along with the saved file's path, since file
+    dates don't always match the week a file covers.
+    """
+    filename = os.path.join(readings_dir, url_basename(url))
+    parquet_filename = filename.removesuffix(".txt") + ".parquet"
+    if os.path.exists(parquet_filename):
+        timestamps = pl.read_parquet(parquet_filename, columns=["timestamp"])
+        return (
+            timestamps["timestamp"].min().date(),
+            timestamps["timestamp"].max().date(),
+            parquet_filename,
         )
-        .unique(["turnstile", "timestamp"])
-        .sort("turnstile", "timestamp")
-        # Some counters count down, so use the size of each change.
-        .with_columns(increase=pl.col("entries").diff().over("turnstile").abs())
-        .filter(pl.col("increase") <= MTA_TURNSTILE_MAX_ENTRIES_PER_READING)
-        .group_by(date=pl.col("timestamp").dt.date())
-        .agg(riders=pl.col("increase").sum())
-        .filter(pl.col("date") >= start)
+
+    # The Internet Archive refuses connections for a few minutes when it's sent too
+    # many requests, so wait longer between attempts.
+    with open(filename, "wb") as f:
+        f.write(download_with_retries(url, {}, attempts=6, delay=60))
+    readings = (
+        read_archived_turnstile_file(filename)
+        .filter(~pl.col("unit").is_in(excluded_units))
+        .select(
+            turnstile=pl.concat_str("c_a", "unit", "scp", separator="/"),
+            timestamp=(pl.col("date") + " " + pl.col("time")).str.to_datetime(
+                "%m-%d-%y %H:%M:%S"
+            ),
+            entries=pl.col("entries").cast(pl.Int64),
+        )
+    )
+    os.remove(filename)
+    first_date = readings["timestamp"].min().date()
+    last_date = readings["timestamp"].max().date()
+    # Truncated captures only cover part of a week.
+    if last_date - first_date < timedelta(days=5):
+        raise ValueError(f"{url} only covers {first_date} to {last_date}")
+    readings.write_parquet(parquet_filename)
+    return first_date, last_date, parquet_filename
+
+
+def download_archived_turnstile_readings(
+    file_urls: dict[date, str], excluded_units: set[str], readings_dir: str
+) -> list[tuple[date, date, str]]:
+    """
+    Download the archived weekly files before the 2014 dataset. The Internet Archive
+    blocks clients that make too many requests at once, so files are downloaded one at
+    a time. Files already saved in readings_dir are reused.
+    """
+    return [
+        download_archived_turnstile_file(url, excluded_units, readings_dir)
+        for file_date, url in tqdm(sorted(file_urls.items()), desc="archived files")
+        if file_date <= MTA_TURNSTILE_START + timedelta(days=7)
+    ]
+
+
+def archived_turnstile_daily_entries(
+    start: date, end: date, files: list[tuple[date, date, str]]
+) -> pl.DataFrame:
+    """Estimate daily subway entries from start to end (exclusive)."""
+    readings = pl.concat(
+        pl.read_parquet(filename)
+        for first_date, last_date, filename in files
+        if first_date < end and last_date >= start - timedelta(days=1)
+    )
+    return turnstile_daily_entries_from_readings(
+        readings.filter(
+            pl.col("timestamp").dt.date() >= start - timedelta(days=1),
+            pl.col("timestamp").dt.date() < end,
+        ),
+        start,
     )
 
 
@@ -271,7 +445,18 @@ def download_nyc_subway(original_dir: str, processed_dir: str):
     # The raw turnstile readings are too large to keep, so only the daily estimates
     # computed from them are saved.
     turnstile_days = []
-    month_start = MTA_TURNSTILE_START
+    with tempfile.TemporaryDirectory() as readings_dir:
+        files = download_archived_turnstile_readings(
+            archived_turnstile_file_urls(), non_subway_turnstile_units(), readings_dir
+        )
+        month_start = min(first_date for first_date, _, _ in files).replace(day=1)
+        while month_start < MTA_TURNSTILE_START:
+            next_month = (month_start + timedelta(days=32)).replace(day=1)
+            turnstile_days.append(
+                archived_turnstile_daily_entries(month_start, next_month, files)
+            )
+            month_start = next_month
+
     with tqdm(desc="turnstile months", unit="month") as pbar:
         while month_start < MTA_SUBWAY_HOURLY_START:
             next_month = (month_start + timedelta(days=32)).replace(day=1)

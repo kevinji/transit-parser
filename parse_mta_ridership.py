@@ -45,7 +45,7 @@ def parse_nyc_subway_weekday_ridership(filename: str) -> pl.DataFrame:
     )
 
     expected_weekdays = (
-        pl.date_range(first_date, last_date, "1d", eager=True)
+        pl.date_range(first_date.replace(day=1), last_date, "1d", eager=True)
         .alias("date")
         .to_frame()
         .group_by(month_start=pl.col("date").dt.truncate("1mo"))
