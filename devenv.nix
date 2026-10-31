@@ -9,7 +9,10 @@
 
   # https://devenv.sh/languages/
   languages.python.enable = true;
-  languages.python.version = "3.13";
+  # TODO: Restore `languages.python.version = "3.13";` (and the nixpkgs-python
+  # input in devenv.yaml) once nixpkgs-python builds 3.13.18+ again; it failed
+  # because nixpkgs' mimetypes.patch no longer applies.
+  languages.python.package = pkgs.python313;
   languages.python.uv.enable = true;
 
   # https://devenv.sh/processes/
