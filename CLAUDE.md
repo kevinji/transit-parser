@@ -8,8 +8,6 @@ Run Python through devenv and the locked uv environment:
 devenv shell -- uv run --locked python <script> <mode>
 ```
 
-The repository-root `.venv` is stale (it points at an old mise Python), so don't use it.
-
 ## Workflow
 
 Modes for both scripts: `bart`, `dc-metro`, `link-light-rail`, `muni`, `nyc-subway`.
